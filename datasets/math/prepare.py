@@ -25,14 +25,64 @@ from collections import defaultdict
 from pathlib import Path
 
 sys.path.append(str(Path(__file__).parents[1]))
+
+from fix_ref_solns import _fix_solution, _post_fix, _post_fix_multi_answer
 from utils import prepare_for_sft
 
-from nemo_skills.code_execution.math_grader import extract_answer, normalize_answer_string
+from nemo_skills.code_execution.math_grader import normalize_answer_string
 
 # utils is adding main package to path already
 from nemo_skills.inference.prompt.utils import prompt_types
 
 DOWNLOAD_LINK = "https://people.eecs.berkeley.edu/~hendrycks/MATH.tar"
+
+
+def find_boxed_entries(answer_str):
+    stack = []
+    results = []
+    i = 0
+
+    while i < len(answer_str):
+        if answer_str[i : i + 7] == '\\boxed{':
+            stack.append(i + 7)
+            i += 7
+        elif answer_str[i] == '{':
+            if stack:
+                stack.append(i + 1)
+            i += 1
+        elif answer_str[i] == '}':
+            if stack:
+                start = stack.pop()
+                if not stack:
+                    results.append(answer_str[start:i])
+            i += 1
+        else:
+            i += 1
+
+    if len(results) == 0:
+        raise ValueError("Not enough boxed entries")
+    else:
+        results = [normalize_answer_string(result) for result in results]
+
+    if len(results) == 1:
+        # Single boxed entry, trivial case
+        return results
+
+    else:
+        # Multiple boxed entries. There are two cases possible
+        # (a) The reference solution has the same question answered in multiple ways
+        # (b) The answer is split across multiple boxed entries and we need to merge
+        result_equal = True
+        for idx in range(len(results) - 1):
+            if not (results[idx] == results[idx + 1]):
+                result_equal = False
+                break
+
+        if result_equal:
+            # Same problem solved in multiple ways
+            return [results[0]]
+        else:
+            return results
 
 
 def extract_attributes_from_name(file_name):
@@ -54,57 +104,10 @@ def extract_answer_string_2(answer_str):
     return stripped_answer
 
 
-def _post_fix(problem_id, soln_string):
-    """Post fixing some answer strings"""
-    if problem_id == "test/intermediate_algebra/78.json":
-        soln_string = re.sub(r"\\(\d+)", r"\1", soln_string)
-
-    if problem_id == "train/number_theory/7115.json":
-        return "A"
-
-    if problem_id == "train/number_theory/1012.json":
-        return "E"
-
-    if problem_id == "train/prealgebra/666.json":
-        return "125"
-
-    if problem_id == "train/intermediate_algebra/172.json":
-        return "two lines"
-
-    if problem_id == "train/prealgebra/1691.json":
-        return "1.85"
-
-    if problem_id == "train/geometry/6177.json":
-        return "C"
-
-    if problem_id == "train/number_theory/7117.json":
-        return "A"
-
-    if problem_id == "train/geometry/6202.json":
-        return "D"
-
-    if problem_id == "train/precalculus/268.json":
-        return "A"
-
-    return soln_string
-
-
-def process_data():
-    """Download tar and condense data into single jsonl file."""
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--split_name",
-        required=True,
-        choices=("test", "validation", "train", "train_full"),
-    )
-    parser.add_argument("--random_seed", type=int, default=42)
-    parser.add_argument("--validation_size", type=int, default=1000)
-    parser.add_argument("--prompt_type", default="openmathinstruct/sft", choices=prompt_types)
-    args = parser.parse_args()
-
+def save_data(split_name, random_seed, validation_size, prompt_type):
     output_folder = Path(__file__).absolute().parent
     output_folder.mkdir(exist_ok=True)
-    actual_split_name = "test" if args.split_name == "test" else "train"
+    actual_split_name = "test" if split_name == "test" else "train"
 
     with tempfile.TemporaryDirectory() as temp_dir:
         archive_filename = os.path.join(temp_dir, "temp.tar")
@@ -124,17 +127,19 @@ def process_data():
                     continue
 
                 content = json.loads(reader_f.extractfile(tar_member).read())
+                content["id"] = f"{eval_set}/{problem_type}/{fileid}.json"
                 content["question"] = content["problem"]
-                content["reference_solution"] = content["solution"]
+                # Load the solution with our identified fixes
+                content["reference_solution"] = _fix_solution(content["id"], content["solution"])
                 del content["problem"]
                 del content["solution"]
 
-                answer_string = extract_answer(content["reference_solution"])
+                entries = find_boxed_entries(content["reference_solution"])
+                if len(entries) == 1:
+                    parsed_answer = entries[0]
+                if len(entries) > 1:
+                    parsed_answer = _post_fix_multi_answer(content["id"], entries)
 
-                if answer_string is None:
-                    answer_string = extract_answer_string_2(content["reference_solution"])
-
-                parsed_answer = normalize_answer_string(answer_string)
                 if not (
                     ("Find the equation" in content["question"])
                     or ("Enter the equation" in content["question"])
@@ -153,7 +158,6 @@ def process_data():
                 content_type = content_type.replace("&", "and")
                 assert problem_type == content_type
 
-                content["id"] = f"{eval_set}/{problem_type}/{fileid}.json"
                 content["expected_answer"] = _post_fix(content["id"], content["expected_answer"])
 
                 split_instances_dict[eval_set].append(content)
@@ -161,27 +165,47 @@ def process_data():
         assert len(split_instances_dict) == 1
         for split, instances in split_instances_dict.items():
             # always shuffling to make it easier to get validation/train out of train_full
-            if args.split_name != "test":
-                random.seed(args.random_seed)
+            if split_name != "test":
+                random.seed(random_seed)
                 random.shuffle(instances)
-            if args.split_name == "validation":
-                data = instances[: args.validation_size]
+            if split_name == "validation":
+                data = instances[:validation_size]
                 # dumping SFT-ready validation file as well right away
                 with open(output_folder / "validation-sft.jsonl", "wt", encoding="utf-8") as fout:
-                    for entry in prepare_for_sft(data, args.prompt_type, "math", chat_format=False):
+                    for entry in prepare_for_sft(data, prompt_type, "math", chat_format=False):
                         fout.write(json.dumps(entry) + "\n")
                 with open(output_folder / "validation-sft-chat.jsonl", "wt", encoding="utf-8") as fout:
-                    for entry in prepare_for_sft(data, args.prompt_type, "math", chat_format=True):
+                    for entry in prepare_for_sft(data, prompt_type, "math", chat_format=True):
                         fout.write(json.dumps(entry) + "\n")
-            elif args.split_name == "train":
-                data = instances[args.validation_size :]
+            elif split_name == "train":
+                data = instances[validation_size:]
             else:
                 data = instances
 
-            output_file = os.path.join(output_folder, f"{args.split_name}.jsonl")
+            output_file = os.path.join(output_folder, f"{split_name}.jsonl")
             with open(output_file, "wt", encoding="utf-8") as writer_f:
                 for instance in data:
                     writer_f.write(json.dumps(instance) + "\n")
+
+
+def process_data():
+    """Download tar and condense data into single jsonl file."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--split_name",
+        default="all",
+        choices=("all", "test", "validation", "train", "train_full"),
+    )
+    parser.add_argument("--random_seed", type=int, default=42)
+    parser.add_argument("--validation_size", type=int, default=1000)
+    parser.add_argument("--prompt_type", default="openmathinstruct/sft", choices=prompt_types)
+    args = parser.parse_args()
+
+    if args.split_name == "all":
+        for split_name in ["test", "validation", "train", "train_full"]:
+            save_data(split_name, args.random_seed, args.validation_size, args.prompt_type)
+    else:
+        save_data(args.split_name, args.random_seed, args.validation_size, args.prompt_type)
 
 
 if __name__ == "__main__":

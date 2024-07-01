@@ -59,14 +59,25 @@ def get_server_command(server_type: str, num_gpus: int, num_nodes: int, model_na
             num_tasks = 1
 
     elif server_type == 'vllm':
-        server_start_cmd = (
-            f"NUM_GPUS={num_gpus} bash /code/nemo_skills/inference/server/serve_vllm.sh "
-            f"/model/ {model_name} 0 openai 5000"
-        )
+        if len(model_name.split('/')) == 2 and not os.path.exists(model_name):
+            server_start_cmd = (
+                f"NUM_GPUS={num_gpus} bash /code/nemo_skills/inference/server/serve_vllm.sh "
+                f"{model_name} {model_name} 0 openai 5000"
+            )
+        else:
+            server_start_cmd = (
+                f"NUM_GPUS={num_gpus} bash /code/nemo_skills/inference/server/serve_vllm.sh "
+                f"/model/ {model_name} 0 openai 5000"
+            )
+
+        if os.environ.get("MAX_SEQ_LEN", None) is not None:
+            server_start_cmd = f"export MAX_SEQ_LEN={os.environ['MAX_SEQ_LEN']} && {server_start_cmd}"
+
         num_tasks = 1
     else:
         # adding sleep to ensure the logs file exists
-        server_start_cmd = f"python /code/nemo_skills/inference/server/serve_trt.py --model_path /model"
+        # need this flag for stable Nemotron-4-340B deployment
+        server_start_cmd = f"FORCE_NCCL_ALL_REDUCE_STRATEGY=1 python /code/nemo_skills/inference/server/serve_trt.py --model_path /model"
         num_tasks = num_gpus
     if server_type == "vllm":
         server_wait_string = "Uvicorn running"
@@ -82,8 +93,7 @@ SLURM_HEADER = """
 #SBATCH -t {timeout}
 #SBATCH -J "{job_name_prefix}:{job_name}"
 #SBATCH --ntasks-per-node={tasks_per_node}
-#SBATCH --gpus-per-node={gpus_per_node}
-"""
+#SBATCH --gpus-per-node={gpus_per_node}"""
 
 NEMO_SKILLS_CODE = str(Path(__file__).absolute().parents[1])
 config_file = os.getenv("NEMO_SKILLS_CONFIG")
@@ -93,7 +103,7 @@ if not config_file:
 with open(config_file, "rt", encoding="utf-8") as fin:
     CLUSTER_CONFIG = yaml.safe_load(fin)
 
-SLURM_HEADER = CLUSTER_CONFIG.get("slurm_header", SLURM_HEADER)
+SLURM_HEADER = CLUSTER_CONFIG.get("slurm_header", SLURM_HEADER) + '\n'
 
 
 def launch_local_job(
@@ -236,9 +246,9 @@ EOF
         except KeyError:
             pass
         cmd += f"""
-srun {extra_main_args} --mpi=pmix --container-image={container} --container-mounts={mounts} bash -c "$cmd" &
+srun --no-container-mount-home {extra_main_args} --mpi=pmix --container-image={container} --container-mounts={mounts} bash -c "$cmd" &
 MAIN_PID=$!
-srun {extra_sandbox_args} --mpi=pmix --ntasks={num_nodes} \
+srun --no-container-mount-home {extra_sandbox_args} --mpi=pmix --ntasks={num_nodes} \
      --container-image={CLUSTER_CONFIG["containers"]["sandbox"]} \
      bash -c "/entrypoint.sh && /start.sh" &
 wait $MAIN_PID
@@ -246,7 +256,10 @@ wait $MAIN_PID
 
     # note how we are waiting only for the main command and sandbox will be killed when it finishes
     else:
-        cmd = cmd + f'\nsrun --mpi=pmix --container-image={container} --container-mounts={mounts} bash -c "$cmd"'
+        cmd = (
+            cmd
+            + f'\nsrun  --no-container-mount-home --mpi=pmix --container-image={container} --container-mounts={mounts} bash -c "$cmd"'
+        )
     with tempfile.NamedTemporaryFile(mode="wt", delete=False) as fp:
         fp.write(cmd)
     try:

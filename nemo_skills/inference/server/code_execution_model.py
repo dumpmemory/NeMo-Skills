@@ -112,7 +112,7 @@ class CodeExecutionWrapper:
                 outputs = [output['generation'] for output in self.model.generate(**request)]
                 new_ids = []
                 # checking if any of the outputs need code execution and submitting requests in parallel
-                futures = [None] * len(outputs)
+                futures = [None] * len(prompts)
                 for idx, output in zip(remaining_ids, outputs):
                     if output.strip().endswith(CODE_SEPARATORS[-1]):
                         futures[idx] = executor.submit(
@@ -232,6 +232,9 @@ def get_code_execution_model(server_type, code_execution=None, sandbox=None, **k
     """A helper function to make it easier to set server through cmd."""
     model = get_model(server_type=server_type, **kwargs)
     if isinstance(model, NemoModel):  # nemo handles code execution directly
+        LOG.warning(
+            "Nemo model currently has a bug in handling stop words and thus shouldn't be used for code execution"
+        )
         if code_execution is not None:
             raise ValueError("Extra code execution parameters are not supported for Nemo model.")
         return model

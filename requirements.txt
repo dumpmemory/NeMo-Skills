@@ -1,4 +1,6 @@
 backoff
+evalplus
+huggingface_hub
 hydra-core
 numpy
 openai
