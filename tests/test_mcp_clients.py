@@ -1002,3 +1002,36 @@ async def test_direct_python_tool_cleanup_request_tolerates_delete_failure():
     # Must not raise; session must be removed from the mapping regardless.
     await tool.cleanup_request("req-x")
     assert "req-x" not in tool.requests_to_sessions
+
+
+# -- ArXiv direct tool tests ------------------------------------------------
+
+
+class TestArxivTool:
+    def test_arxiv_tool_config(self):
+        from nemo_skills.mcp.servers.arxiv_tool import ArxivSearchTool
+
+        tool = ArxivSearchTool()
+        assert tool.default_config()["max_results"] == 3
+
+    @pytest.mark.asyncio
+    async def test_arxiv_search_rejects_non_positive_max_results(self):
+        from nemo_skills.mcp.servers.arxiv_tool import ArxivSearchTool
+
+        tool = ArxivSearchTool()
+        tool.configure()
+        result = await tool.execute("arxiv-search", {"query": "quantum entanglement", "max_results": 0})
+        assert result == "max_results must be >= 1."
+
+    @pytest.mark.asyncio
+    async def test_arxiv_direct_list_tools(self):
+        from nemo_skills.mcp.servers.arxiv_tool import ArxivSearchTool
+
+        tool = ArxivSearchTool()
+        tool.configure()
+        tools = await tool.list_tools()
+        tool_names = {t["name"] for t in tools}
+        assert {"arxiv-search", "arxiv-get", "arxiv-sections", "arxiv-read-chunk"} <= tool_names
+        search_tool = next(t for t in tools if t["name"] == "arxiv-search")
+        assert "query" in search_tool["input_schema"]["properties"]
+        assert "max_results" not in search_tool["input_schema"]["properties"]
